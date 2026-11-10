@@ -156,6 +156,12 @@ class ASRDataModule(L.LightningDataModule):
         return batch
 
     def setup(self, stage=None):
+        """
+        Split dataset by rank once and shuffle each pass
+        Split->shuffle and shuffle->split are equivalent in my case
+        because I ensure that n_shards is divisible by world_size.
+        Otherwise, shuffle->split is better.
+        """
         ds1 = load_dataset(
             "Kimang18/compact-DDD-Cambodia-khmer-speech-dataset-v0-2-0", streaming=True
         )
@@ -178,11 +184,31 @@ class ASRDataModule(L.LightningDataModule):
         ds5 = ds5.cast_column("audio", Audio(sampling_rate=16_000))
 
         self.ds_train = [
-            ds1["train"],
-            ds2["train"],
-            ds3["train"],
-            ds4["train"],
-            ds5["train"],
+            split_dataset_by_node(
+                ds1["train"],
+                rank=self.trainer.global_rank,
+                world_size=self.trainer.world_size,
+            ),
+            split_dataset_by_node(
+                ds2["train"],
+                rank=self.trainer.global_rank,
+                world_size=self.trainer.world_size,
+            ),
+            split_dataset_by_node(
+                ds3["train"],
+                rank=self.trainer.global_rank,
+                world_size=self.trainer.world_size,
+            ),
+            split_dataset_by_node(
+                ds4["train"],
+                rank=self.trainer.global_rank,
+                world_size=self.trainer.world_size,
+            ),
+            split_dataset_by_node(
+                ds5["train"],
+                rank=self.trainer.global_rank,
+                world_size=self.trainer.world_size,
+            ),
         ]
 
         self.ds_validation = interleave_datasets(
@@ -211,11 +237,9 @@ class ASRDataModule(L.LightningDataModule):
         #         worker_ds.raw_ds = new_raw_ds
 
         class PyTorchHFIterableDataset(torch.utils.data.IterableDataset):
-            def __init__(self, raw_ds, rank, n_gpus, buffer_size=1_000, seed=0):
-                self.raw_ds, self.rank, self.n_gpus, self.buffer_size, self.seed = (
+            def __init__(self, raw_ds, buffer_size=1_000, seed=0):
+                self.raw_ds, self.buffer_size, self.seed = (
                     raw_ds,
-                    rank,
-                    n_gpus,
                     buffer_size,
                     seed,
                 )
@@ -224,11 +248,10 @@ class ASRDataModule(L.LightningDataModule):
             def _build_pass(self, epoch):
                 """shuffle within sources then interleave"""
                 cur_seed = self.seed + epoch
-                sources = []
-                for source in self.raw_ds:
-                    d = source.shuffle(seed=cur_seed, buffer_size=self.buffer_size)
-                    d = split_dataset_by_node(d, rank=self.rank, world_size=self.n_gpus)
-                    sources.append(d)
+                sources = [
+                    source.shuffle(seed=cur_seed, buffer_size=self.buffer_size)
+                    for source in self.raw_ds
+                ]
                 return interleave_datasets(
                     sources,
                     probabilities=[0.30, 0.23, 0.32, 0.1, 0.05],
@@ -254,8 +277,6 @@ class ASRDataModule(L.LightningDataModule):
         if train:
             dataset = PyTorchHFIterableDataset(
                 dataset,
-                rank=self.trainer.global_rank,
-                n_gpus=self.trainer.world_size,
                 seed=self.hparams.seed,
             )
 
