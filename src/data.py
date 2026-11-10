@@ -233,7 +233,7 @@ class ASRDataModule(L.LightningDataModule):
                     sources,
                     probabilities=[0.30, 0.23, 0.32, 0.1, 0.05],
                     stopping_strategy="all_exhausted",
-                    seed=self.hparams.seed,
+                    seed=self.seed,
                 )
 
             def __iter__(self):
