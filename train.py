@@ -129,94 +129,9 @@ class TrorYongModule(L.LightningModule):
                 for param in block.parameters():
                     param.requires_grad = False
 
-        # decoder parameters for Muon
-        hidden_matrix_params = []
-        matrix_lp = []
-        print(10 * "=", "hidden")
-        for n, p in self.net.named_parameters():
-            if ("conv3" in n or "len_predictor" in n) and p.ndim >= 2:
-                matrix_lp.append(p)
-                print("lp", n)
-            elif (
-                "encoder" not in n
-                and "embed" not in n
-                and "len_predictor.head" not in n
-                and p.ndim >= 2
-            ):
-                hidden_matrix_params.append(p)
-                print(n)
-            # if "encoder" not in n and "embed" not in n and "len_predictor.head" not in n and p.ndim >= 2:
-            #     hidden_matrix_params.append(p)
-            #     print(n)
-
-        scalar_params = []
-        scalar_lp = []
-        print(10 * "=", "scalar")
-        for n, p in self.net.named_parameters():
-            # if ("conv3" in n or "len_predictor_head" in n) and p.ndim < 2:
-            if "len_predictor" in n and p.ndim < 2:
-                scalar_lp.append(p)
-                print("lp", n)
-            elif "encoder" not in n and p.ndim < 2:
-                scalar_params.append(p)
-                print(n)
-
-        embed_params_lp = []
-        # when using pos_basis, there is no more embedding parameters as tok_embed is tied with lm_head
-        print(10 * "=", "embed")
-        # for n, p in self.net.named_parameters():
-        # if "encoder" not in n and "task_embed" in n: # exclude tok_embed because of weight tying and head_params
-        #     print(n)
-        #     embed_params_lp.append(p)
-
-        head_params = [self.net.lm_head.weight]
-
-        # encoder
-        enc_matrix_params = []
-        print(10 * "=", "encoder hidden")
-        for n, p in self.net.named_parameters():
-            if "encoder" in n and "embed" not in n and p.ndim >= 2:
-                enc_matrix_params.append(p)
-                print(n)
-
-        enc_scalar_params = []
-        print(10 * "=", "scalar")
-        for n, p in self.net.named_parameters():
-            if "encoder" in n and p.ndim < 2:
-                enc_scalar_params.append(p)
-                print(n)
-
-        # only clip the parameters of adam_group
-        self.clip_params = (
-            scalar_params + head_params + enc_scalar_params
-        )  # + embed_params
-        assert len(list(self.net.parameters())) == len(hidden_matrix_params) + len(
-            matrix_lp
-        ) + len(scalar_params) + len(scalar_lp) + len(embed_params_lp) + len(
-            head_params
-        ) + len(enc_matrix_params) + len(enc_scalar_params)
-
-        muon_groups = [
-            dict(params=hidden_matrix_params, lr=7e-3),
-            dict(params=enc_matrix_params, lr=1e-4),  # 1e-4
-        ]
-        muon_groups = [
-            dict(**g, momentum=0.95, weight_decay=0.1, use_muon=True)
-            for g in muon_groups
-        ]
-
-        adam_groups = [
-            dict(params=head_params + matrix_lp, lr=1e-3, weight_decay=0.1),
-            dict(params=embed_params_lp, lr=8e-3, weight_decay=0.01),
-            dict(params=scalar_params + scalar_lp, lr=7e-3, weight_decay=0.0),
-            dict(params=enc_scalar_params, lr=1e-4, weight_decay=0.0),  # 1e-4
-        ]
-        adam_groups = [
-            dict(**g, betas=(0.9, 0.95), eps=1e-6, use_muon=False) for g in adam_groups
-        ]
-
-        param_groups = [*adam_groups, *muon_groups]
+        param_groups, clip_params = self.net.configure_optimizer()
         optimizer = MuonWithAuxAdam(param_groups)
+        self.clip_params = clip_params
 
         optimizer_steps = int(self.trainer.estimated_stepping_batches)
         warmup_steps = int(0.015 * optimizer_steps)
