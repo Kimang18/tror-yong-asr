@@ -1,4 +1,5 @@
 import logging
+import math
 
 import hydra
 import lightning as L
@@ -15,7 +16,7 @@ from omegaconf import DictConfig
 from safetensors.torch import save_model
 from src.net import TrorYongASRDev
 from torchdata.stateful_dataloader import StatefulDataLoader
-from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
+from transformers import AutoTokenizer
 from tror_yong_asr import TrorYongASRConfig
 
 from src.data import ASRDataModule
@@ -217,21 +218,27 @@ class TrorYongModule(L.LightningModule):
         param_groups = [*adam_groups, *muon_groups]
         optimizer = MuonWithAuxAdam(param_groups)
 
-        optimizer_steps = int(
-            self.trainer.limit_train_batches / self.trainer.accumulate_grad_batches
-        )
-
+        optimizer_steps = int(self.trainer.estimated_stepping_batches)
         warmup_steps = int(0.015 * optimizer_steps)
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer, num_warmup_steps=warmup_steps, num_training_steps=optimizer_steps
-        )
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return (step + 1) / max(1, warmup_steps)
+            progress = (step - warmup_steps) / max(1, optimizer_steps - warmup_steps)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+        # scheduler = get_cosine_schedule_with_warmup(
+        #     optimizer, num_warmup_steps=warmup_steps, num_training_steps=optimizer_steps
+        # )
 
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "interval": "step",
-                "frequency": self.trainer.accumulate_grad_batches,
+                "frequency": 1,
             },
         }
 
@@ -256,10 +263,9 @@ def main(cfg: DictConfig):
         **cfg.data,
     )
 
+    # lm_head outputs logit over 5 special tokens too (km, en, transcribe, translate, nospeech) this is because embedding layer must contain these tokens and lm_head shares weight with embedding layer
     config = TrorYongASRConfig(
-        vocab_size=len(
-            tokenizer
-        ),  # lm_head outputs logit over 5 special tokens too (km, en, transcribe, translate, nospeech) this is because embedding layer must contain these tokens and lm_head shares weight with embedding layer
+        vocab_size=len(tokenizer),
         n_audio_ctx=cfg.net.n_audio_ctx,
         n_text_ctx=cfg.net.n_text_ctx,
         dropout=cfg.net.dropout,
@@ -290,13 +296,19 @@ def main(cfg: DictConfig):
     # logger = WandbLogger(project=f"TrorYongASR-{cfg.net_size}", log_model=True)
     # logger.watch(net)
 
+    class JupyterNoProgressBar(TQDMProgressBar):
+        def init_validation_tqdm(self):
+            bar = super().init_validation_tqdm()
+            bar.disable = True  # Turns off the validation progress bar completely
+            return bar
+
     torch.set_float32_matmul_precision("high")
     trainer = L.Trainer(
         num_sanity_val_steps=0,  # skip sanity check
         enable_progress_bar=True,
         check_val_every_n_epoch=None,  # Important for streaming!
         callbacks=[
-            TQDMProgressBar(refresh_rate=200),
+            JupyterNoProgressBar(refresh_rate=200),
             # LearningRateMonitor(logging_interval='step'),
             # ckpt_callback,
             weights_callback,

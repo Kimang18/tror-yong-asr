@@ -7,12 +7,16 @@ import torch.nn.functional as F
 import torchaudio.transforms as T
 from datasets import Audio, interleave_datasets, load_dataset
 from datasets.distributed import split_dataset_by_node
-from torch.utils.data import get_worker_info
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 
 @dataclass
 class WhisperDataCollatorWithPadding:
+    """
+    batching waveforms and sequences of tokens
+    lightning module will convert waveforms into mel spectrogram
+    """
+
     def __call__(self, features: list[dict]) -> dict:
         waveforms, wave_lengths = [], []
         token_ids, num_tokens = [], []
@@ -96,6 +100,9 @@ class ASRDataModule(L.LightningDataModule):
         self.freq_mask = T.FrequencyMasking(freq_mask_param=27)
 
     def on_after_batch_transfer(self, batch: dict, dataloader_idx: int) -> dict:
+        """
+        Prepare (input_ids, labels) pair and convert waveforms to mel spectrogram
+        """
         token_ids = batch.pop("token_ids")
 
         batch["input_ids"] = token_ids[:, :-1].detach().clone()
@@ -170,12 +177,13 @@ class ASRDataModule(L.LightningDataModule):
         ds4 = ds4.cast_column("audio", Audio(sampling_rate=16_000))
         ds5 = ds5.cast_column("audio", Audio(sampling_rate=16_000))
 
-        self.ds_train = interleave_datasets(
-            [ds1["train"], ds2["train"], ds3["train"], ds4["train"], ds5["train"]],
-            probabilities=[0.30, 0.23, 0.32, 0.1, 0.05],
-            stopping_strategy="all_exhausted",
-            seed=self.hparams.seed,
-        )
+        self.ds_train = [
+            ds1["train"],
+            ds2["train"],
+            ds3["train"],
+            ds4["train"],
+            ds5["train"],
+        ]
 
         self.ds_validation = interleave_datasets(
             [ds1["test"], ds2["test"], ds3["validation"], ds4["test"]],
@@ -188,52 +196,82 @@ class ASRDataModule(L.LightningDataModule):
         self.time_mask.to("cuda")
         self.freq_mask.to("cuda")
 
-    def get_dataloader(self, dataset, batch_size, num_workers, shard_on_rank=True):
-        def worker_init_fn(worker_id: int):
-            worker_info = get_worker_info()
-            if worker_info is not None:
-                worker_ds = worker_info.dataset
-                worker_ds.hf_ds = worker_ds.hf_ds.shard(
-                    num_shards=worker_info.num_workers, index=worker_info.id
-                )
+    def get_dataloader(self, dataset, batch_size, num_workers, train=True):
+        # def worker_init_fn(worker_id: int):
+        #     worker_info = get_worker_info()
+        #     if worker_info is not None:
+        #         worker_ds = worker_info.dataset
+        #         new_raw_ds = [
+        #             source.shard(
+        #                 num_shards=worker_info.num_workers,
+        #                 index=worker_info.id
+        #             )
+        #             for source in worker_ds.raw_ds
+        #         ]
+        #         worker_ds.raw_ds = new_raw_ds
 
         class PyTorchHFIterableDataset(torch.utils.data.IterableDataset):
-            def __init__(self, hf_ds, buffer_size=4_000, seed=0):
-                self.hf_ds, self.buffer_size, self.seed = hf_ds, buffer_size, seed
+            def __init__(self, raw_ds, rank, n_gpus, buffer_size=1_000, seed=0):
+                self.raw_ds, self.rank, self.n_gpus, self.buffer_size, self.seed = (
+                    raw_ds,
+                    rank,
+                    n_gpus,
+                    buffer_size,
+                    seed,
+                )
+                self.epoch = 0
+
+            def _build_pass(self, epoch):
+                """shuffle within sources then interleave"""
+                cur_seed = self.seed + epoch
+                sources = []
+                for source in self.raw_ds:
+                    d = source.shuffle(seed=cur_seed, buffer_size=self.buffer_size)
+                    d = split_dataset_by_node(d, rank=self.rank, world_size=self.n_gpus)
+                    sources.append(d)
+                return interleave_datasets(
+                    sources,
+                    probabilities=[0.30, 0.23, 0.32, 0.1, 0.05],
+                    stopping_strategy="all_exhausted",
+                    seed=self.hparams.seed,
+                )
 
             def __iter__(self):
-                epoch = 0
+                epoch = self.epoch
                 while True:
-                    self.hf_ds.set_epoch(epoch)
-                    # yield from self.hf_ds.shuffle(seed=self.seed, buffer_size=self.buffer_size)
-                    yield from self.hf_ds
+                    yield from self._build_pass(epoch)
                     epoch += 1
 
             def state_dict(self):
-                return self.hf_ds.state_dict()
+                state_dict = self.hf_ds.state_dict()
+                state_dict["dataset_epoch_count"] = self.epoch
+                return state_dict
 
             def load_state_dict(self, state_dict):
                 self.hf_ds.load_state_dict(state_dict)
+                self.epoch = state_dict.get("dataset_epoch_count", 0)
 
-        if shard_on_rank:
-            dataset = split_dataset_by_node(
+        if train:
+            dataset = PyTorchHFIterableDataset(
                 dataset,
                 rank=self.trainer.global_rank,
-                world_size=self.trainer.world_size,
+                n_gpus=self.trainer.world_size,
+                seed=self.hparams.seed,
             )
-        dataset = PyTorchHFIterableDataset(dataset, seed=self.hparams.seed)
 
         return StatefulDataLoader(
             dataset,
             batch_size=batch_size,
             collate_fn=WhisperDataCollatorWithPadding(),
             num_workers=num_workers,
-            pin_memory=num_workers
-            > 0,  # pin_memory will lock memory while in this training, memory is quite needed.
+            pin_memory=(
+                num_workers
+                > 0,  # pin_memory will lock memory while in this training, memory is quite scarce.
+            ),
             persistent_workers=num_workers > 0,
             prefetch_factor=2 if num_workers > 0 else None,
             drop_last=True,
-            worker_init_fn=worker_init_fn,
+            # worker_init_fn=worker_init_fn,
         )
 
     def train_dataloader(self):
@@ -241,7 +279,7 @@ class ASRDataModule(L.LightningDataModule):
             self.ds_train,
             self.hparams.bs_per_device,
             self.hparams.n_worker_per_device,
-            True,
+            train=True,
         )
 
         # restore loader if needed
@@ -256,7 +294,7 @@ class ASRDataModule(L.LightningDataModule):
 
     def val_dataloader(self):
         return self.get_dataloader(
-            self.ds_validation, self.hparams.bs_per_device, 0, False
+            self.ds_validation, self.hparams.bs_per_device, 0, train=False
         )
 
     # def test_dataloader(self):
