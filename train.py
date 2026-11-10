@@ -13,13 +13,13 @@ from lightning.pytorch.callbacks import (
 )
 from omegaconf import DictConfig
 from safetensors.torch import save_model
-from src.net import TrorYongASRDev
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 from tror_yong_asr import TrorYongASRConfig
 
-from src.data import ASRDataModule
-from src.muon_adam import MuonWithAuxAdam
+from .src.data import ASRDataModule
+from .src.muon_adam import MuonWithAuxAdam
+from .src.net import TrorYongASRDev
 
 # Set the logging level for httpx to WARNING to hide INFO logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
