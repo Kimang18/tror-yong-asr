@@ -201,7 +201,7 @@ def main(cfg: DictConfig):
     # os.makedirs(save_dir, exist_ok=True)
     weights_callback = ModelCheckpoint(
         # dirpath=save_dir,
-        monitor="val_acc",
+        monitor="val/acc",
         mode="max",
         save_top_k=1,
         # Adding {step} to the filename is best practice for step-based training
