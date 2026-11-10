@@ -6,7 +6,6 @@ import lightning as L
 import torch
 import torchmetrics as tm
 import whisper
-from adam_muon_optimizer.adam_muon import MuonWithAuxAdam
 from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks import (
     ModelCheckpoint,
@@ -20,6 +19,7 @@ from transformers import AutoTokenizer
 from tror_yong_asr import TrorYongASRConfig
 
 from src.data import ASRDataModule
+from src.muon_adam import MuonWithAuxAdam
 
 # Set the logging level for httpx to WARNING to hide INFO logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
