@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torchaudio.transforms as T
 from datasets import Audio, interleave_datasets, load_dataset
 from datasets.distributed import split_dataset_by_node
+from torch.utils.data import get_worker_info
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 
@@ -157,10 +158,8 @@ class ASRDataModule(L.LightningDataModule):
 
     def setup(self, stage=None):
         """
-        Split dataset by rank once and shuffle each pass
-        Split->shuffle and shuffle->split are equivalent in my case
-        because I ensure that n_shards is divisible by world_size.
-        Otherwise, shuffle->split is better.
+        Manual spltiting training set:
+        Split across rank -> split across workers
         """
         ds1 = load_dataset(
             "Kimang18/compact-DDD-Cambodia-khmer-speech-dataset-v0-2-0", streaming=True
@@ -223,18 +222,17 @@ class ASRDataModule(L.LightningDataModule):
         self.freq_mask.to("cuda")
 
     def get_dataloader(self, dataset, batch_size, num_workers, train=True):
-        # def worker_init_fn(worker_id: int):
-        #     worker_info = get_worker_info()
-        #     if worker_info is not None:
-        #         worker_ds = worker_info.dataset
-        #         new_raw_ds = [
-        #             source.shard(
-        #                 num_shards=worker_info.num_workers,
-        #                 index=worker_info.id
-        #             )
-        #             for source in worker_ds.raw_ds
-        #         ]
-        #         worker_ds.raw_ds = new_raw_ds
+        def worker_init_fn(worker_id: int):
+            worker_info = get_worker_info()
+            if worker_info is not None:
+                worker_ds = worker_info.dataset
+                new_raw_ds = [
+                    source.shard(
+                        num_shards=worker_info.num_workers, index=worker_info.id
+                    )
+                    for source in worker_ds.raw_ds
+                ]
+                worker_ds.raw_ds = new_raw_ds
 
         class PyTorchHFIterableDataset(torch.utils.data.IterableDataset):
             def __init__(self, raw_ds, buffer_size=1_000, seed=0):
@@ -247,16 +245,17 @@ class ASRDataModule(L.LightningDataModule):
 
             def _build_pass(self, epoch):
                 """shuffle within sources then interleave"""
-                cur_seed = self.seed + epoch
-                sources = [
-                    source.shuffle(seed=cur_seed, buffer_size=self.buffer_size)
-                    for source in self.raw_ds
-                ]
+                seed = self.seed + epoch
+                sources = []
+                for i in range(len(self.raw_ds)):
+                    self.raw_ds[i].set_epoch(epoch)
+                    sources.append(self.raw_ds[i])
+
                 return interleave_datasets(
                     sources,
                     probabilities=[0.30, 0.23, 0.32, 0.1, 0.05],
                     stopping_strategy="all_exhausted",
-                    seed=self.seed,
+                    seed=seed,
                 )
 
             def __iter__(self):
@@ -292,7 +291,7 @@ class ASRDataModule(L.LightningDataModule):
             persistent_workers=num_workers > 0,
             prefetch_factor=2 if num_workers > 0 else None,
             drop_last=True,
-            # worker_init_fn=worker_init_fn,
+            worker_init_fn=worker_init_fn,
         )
 
     def train_dataloader(self):
