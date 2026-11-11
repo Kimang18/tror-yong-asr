@@ -1,0 +1,45 @@
+seed: 3407
+model:
+    train_encoder_layer: -1 # train all encoder layers
+    compile: false
+
+net:
+    n_audio_ctx: 1500
+    n_text_ctx: 448
+    dropout: 0.1
+    bias: true
+    size: ${sizes.${net_size}}
+
+net_size: tiny
+
+sizes:
+    tiny:
+        n_mels: 80
+        n_embed: 384
+        n_layer: 4
+        n_head: 6
+    base:
+        n_mels: 80
+        n_embed: 512
+        n_layer: 6
+        n_head: 8
+    small:
+        n_mels: 80
+        n_embed: 768
+        n_layer: 12
+        n_head: 12
+
+data:
+    bs_per_device: 8
+    n_worker_per_device: 0
+
+trainer:
+    val_check_interval: 6766    # Run validation every 6766 batches pulled from val_dataloader
+    limit_train_batches: 81192  # Total number of batches pulled from train_loader, use this when doing multiple training phases # 81192 is roughly 2 epochs for batch_size 8
+    max_epochs: 1
+    max_steps: -1
+    accumulate_grad_batches: 8
+    gradient_clip_val: 0.5
+    accelerator: "auto"
+    precision: "16-mixed"
+    devices: 1
