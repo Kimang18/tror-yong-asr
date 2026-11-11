@@ -18,17 +18,16 @@ sizes:
         n_embed: 384
         n_layer: 4
         n_head: 6
-    base:
-        n_mels: 80
-        n_embed: 512
-        n_layer: 6
-        n_head: 8
     small:
         n_mels: 80
         n_embed: 768
         n_layer: 12
         n_head: 12
-
+    large:
+        n_mels: 128
+        n_embed: 1280
+        n_layer: 32
+        n_head: 20
 data:
     bs_per_device: 8
     n_worker_per_device: 0
