@@ -13,13 +13,13 @@ from lightning.pytorch.callbacks import (
 )
 from omegaconf import DictConfig
 from safetensors.torch import save_model
-from src.net import TrorYongASRDev
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 from tror_yong_asr import TrorYongASRConfig
 
 from src.data import ASRDataModule
 from src.muon_adam import MuonWithAuxAdam
+from src.net import TrorYongASRDev
 
 # Set the logging level for httpx to WARNING to hide INFO logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -39,6 +39,7 @@ class TrorYongModule(L.LightningModule):
         )
 
     def training_step(self, batch: dict, batch_idx: int):
+        # default logging: on_step=True, on_epoch=False
         bs = batch["mels"].shape[0]
         loss, len_loss = self.net.decoder_forward(
             *self.net.encoder(batch["mels"], batch["mel_masks"]),
@@ -75,15 +76,22 @@ class TrorYongModule(L.LightningModule):
         self.val_acc.reset()
 
     def validation_step(self, batch, batch_idx):
+        # default logging: on_step=False, on_epoch=False
         bs = batch["mels"].shape[0]
         outputs = self.net(**batch)
         self.val_acc.update(
             outputs.logits.reshape(-1, self.net.vocab_size),
             batch["labels"].reshape(-1),
         )
-        self.log("val/loss_dec", outputs.dec_loss, prog_bar=True, batch_size=bs)
-        self.log("val/loss_len", outputs.len_loss, batch_size=bs)
-        self.log("val/acc", self.val_acc, prog_bar=True)
+        self.log("val_acc", self.val_acc, prog_bar=True)
+        self.log(
+            "val/loss_dec",
+            outputs.dec_loss,
+            prog_bar=True,
+            batch_size=bs,
+            sync_dist=True,
+        )
+        self.log("val/loss_len", outputs.len_loss, batch_size=bs, sync_dist=True)
 
     def setup(self, stage: str) -> None:
         """Lightning hook that is called at the beginning of fit (train + validate), validate,
@@ -206,7 +214,7 @@ def main(cfg: DictConfig):
     # os.makedirs(save_dir, exist_ok=True)
     weights_callback = ModelCheckpoint(
         # dirpath=save_dir,
-        monitor="val/acc",
+        monitor="val_acc",
         mode="max",
         save_top_k=1,
         # Adding {step} to the filename is best practice for step-based training
