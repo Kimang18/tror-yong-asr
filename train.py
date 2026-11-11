@@ -133,10 +133,12 @@ class TrorYongModule(L.LightningModule):
         self.clip_params = clip_params
         optimizer = MuonWithAuxAdam(param_groups)
 
-        # effective_opt_steps = int(self.trainer.estimated_stepping_batches) # this depends on limit_train_batches
         total_opt_steps = int(
-            self.trainer.max_steps / self.trainer.accumulate_grad_batches
-        )
+            self.trainer.estimated_stepping_batches
+        )  # this depends on limit_train_batches
+        # total_opt_steps = int(
+        #     self.trainer.max_steps / self.trainer.accumulate_grad_batches
+        # )
 
         warmup_steps = int(0.015 * total_opt_steps)
 
