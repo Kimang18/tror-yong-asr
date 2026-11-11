@@ -13,13 +13,13 @@ from lightning.pytorch.callbacks import (
 )
 from omegaconf import DictConfig
 from safetensors.torch import save_model
+from src.net import TrorYongASRDev
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 from tror_yong_asr import TrorYongASRConfig
 
-from .src.data import ASRDataModule
-from .src.muon_adam import MuonWithAuxAdam
-from .src.net import TrorYongASRDev
+from src.data import ASRDataModule
+from src.muon_adam import MuonWithAuxAdam
 
 # Set the logging level for httpx to WARNING to hide INFO logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -45,23 +45,27 @@ class TrorYongModule(L.LightningModule):
             batch["input_ids"],
             batch["labels"],
         )
+        total_loss = loss + len_loss
         self.log(
-            "train/loss",
+            "train/loss_total",
+            total_loss,
+            batch_size=bs,
+        )
+        self.log(
+            "train/loss_dec",
             loss,
-            on_step=True,
-            on_epoch=False,
             prog_bar=True,
             batch_size=bs,
         )
-        for i in range(len(self.trainer.optimizers[0].param_groups)):
-            cur_lr = self.trainer.optimizers[0].param_groups[i]["lr"]
-            self.log(f"lr/pg_{i + 1}", cur_lr, on_step=True)
-        # if self.trainer.fit_loop.epoch_loop.total_batch_idx + 1 > self.trainer.max_steps:
-        #     self.trainer.should_stop = True
-        # track attention logits, for debugging only
-        # with torch.no_grad():
-        #     max_logit = torch.stack([self.net.decoder.self_attn.max_logits, self.net.decoder.cross_attn.max_logits]).max()
-        # self.log('train_attn_logit', max_logit, on_step=True, prog_bar=False)
+        self.log(
+            "train/loss_len",
+            len_loss,
+            batch_size=bs,
+        )
+        sch = self.lr_schedulers()
+        for i, lr in enumerate(sch.get_last_lr()):
+            self.log(f"lr/pg_{i}", lr)
+
         return loss + len_loss
 
     def on_train_start(self) -> None:
@@ -77,13 +81,9 @@ class TrorYongModule(L.LightningModule):
             outputs.logits.reshape(-1, self.net.vocab_size),
             batch["labels"].reshape(-1),
         )
-        self.log("val/loss", outputs.loss, prog_bar=True, batch_size=bs)
+        self.log("val/loss_dec", outputs.dec_loss, prog_bar=True, batch_size=bs)
+        self.log("val/loss_len", outputs.len_loss, batch_size=bs)
         self.log("val/acc", self.val_acc, prog_bar=True)
-
-    # def on_validation_epoch_end(self):
-    #     loss = self.val_loss.compute()
-    #     self.val_loss_best(loss)
-    #     self.log('val_loss_best', self.val_loss_best.compute(), sync_dist=True, prog_bar=True)
 
     def setup(self, stage: str) -> None:
         """Lightning hook that is called at the beginning of fit (train + validate), validate,
@@ -130,20 +130,23 @@ class TrorYongModule(L.LightningModule):
                     param.requires_grad = False
 
         param_groups, clip_params = self.net.configure_optimizer()
-        optimizer = MuonWithAuxAdam(param_groups)
         self.clip_params = clip_params
+        optimizer = MuonWithAuxAdam(param_groups)
 
-        optimizer_steps = int(self.trainer.estimated_stepping_batches)
-        warmup_steps = int(0.015 * optimizer_steps)
+        # effective_opt_steps = int(self.trainer.estimated_stepping_batches) # this depends on limit_train_batches
+        total_opt_steps = int(
+            self.trainer.max_steps / self.trainer.accumulate_grad_batches
+        )
+
+        warmup_steps = int(0.015 * total_opt_steps)
 
         def lr_lambda(step):
             if step < warmup_steps:
                 return (step + 1) / max(1, warmup_steps)
-            progress = (step - warmup_steps) / max(1, optimizer_steps - warmup_steps)
+            progress = (step - warmup_steps) / max(1, total_opt_steps - warmup_steps)
             return 0.5 * (1.0 + math.cos(math.pi * progress))
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
         # scheduler = get_cosine_schedule_with_warmup(
         #     optimizer, num_warmup_steps=warmup_steps, num_training_steps=optimizer_steps
         # )
@@ -197,7 +200,7 @@ def main(cfg: DictConfig):
 
     model = TrorYongModule(net, **cfg.model)
 
-    # save_dir = "/content/drive/MyDrive/Checkpoint_TrorYongASR"
+    # save_dir = "path_to_ckpt"
     # os.makedirs(save_dir, exist_ok=True)
     weights_callback = ModelCheckpoint(
         # dirpath=save_dir,
@@ -208,8 +211,6 @@ def main(cfg: DictConfig):
         filename="model-{step:06d}-{val_acc:.3f}",
         # every_n_train_steps=500, # Ensures the callback checks the monitor every 500 steps
     )
-    # logger = WandbLogger(project=f"TrorYongASR-{cfg.net_size}", log_model=True)
-    # logger.watch(net)
 
     class JupyterNoProgressBar(TQDMProgressBar):
         def init_validation_tqdm(self):
@@ -219,7 +220,7 @@ def main(cfg: DictConfig):
 
     torch.set_float32_matmul_precision("high")
     trainer = L.Trainer(
-        num_sanity_val_steps=0,  # skip sanity check
+        # num_sanity_val_steps=0,  # skip sanity check
         enable_progress_bar=True,
         check_val_every_n_epoch=None,  # Important for streaming!
         callbacks=[
@@ -233,8 +234,7 @@ def main(cfg: DictConfig):
     )
 
     trainer.fit(model, dm)
-    # trainer.fit(model, dm, ckpt_path="/content/drive/MyDrive/Checkpoint_TrorYongASR/model-step=007611-val_acc=0.863.ckpt")
-    # torch.save(model.net.state_dict(), "best_model_params1.pt")
+    # trainer.fit(model, dm, ckpt_path="path_to_ckpt/model-step=007611-val_acc=0.863.ckpt")
     save_model(net, "model.safetensors")
     print(weights_callback.best_model_path)
 

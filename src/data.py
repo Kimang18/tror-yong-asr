@@ -157,10 +157,6 @@ class ASRDataModule(L.LightningDataModule):
         return batch
 
     def setup(self, stage=None):
-        """
-        Manual spltiting training set:
-        Split across rank -> split across workers
-        """
         ds1 = load_dataset(
             "Kimang18/compact-DDD-Cambodia-khmer-speech-dataset-v0-2-0", streaming=True
         )
@@ -234,50 +230,51 @@ class ASRDataModule(L.LightningDataModule):
                 ]
                 worker_ds.raw_ds = new_raw_ds
 
-        class PyTorchHFIterableDataset(torch.utils.data.IterableDataset):
-            def __init__(self, raw_ds, buffer_size=1_000, seed=0):
-                self.raw_ds, self.buffer_size, self.seed = (
-                    raw_ds,
-                    buffer_size,
-                    seed,
-                )
-                self.epoch = 0
-
-            def _build_pass(self, epoch):
-                """shuffle within sources then interleave"""
-                seed = self.seed + epoch
-                sources = []
-                for i in range(len(self.raw_ds)):
-                    self.raw_ds[i].set_epoch(epoch)
-                    sources.append(self.raw_ds[i])
-
-                return interleave_datasets(
-                    sources,
-                    probabilities=[0.30, 0.23, 0.32, 0.1, 0.05],
-                    stopping_strategy="all_exhausted",
-                    seed=seed,
-                )
-
-            def __iter__(self):
-                epoch = self.epoch
-                while True:
-                    yield from self._build_pass(epoch)
-                    epoch += 1
-
-            def state_dict(self):
-                state_dict = self.hf_ds.state_dict()
-                state_dict["dataset_epoch_count"] = self.epoch
-                return state_dict
-
-            def load_state_dict(self, state_dict):
-                self.hf_ds.load_state_dict(state_dict)
-                self.epoch = state_dict.get("dataset_epoch_count", 0)
-
         if train:
-            dataset = PyTorchHFIterableDataset(
-                dataset,
-                seed=self.hparams.seed,
-            )
+
+            class PyTorchHFIterableDataset(torch.utils.data.IterableDataset):
+                def __init__(self, raw_ds, buffer_size=500, seed=0):
+                    self.raw_ds, self.buffer_size, self.seed = (
+                        raw_ds,
+                        buffer_size,
+                        seed,
+                    )
+                    self.epoch = 0
+
+                def _build_pass(self, epoch):
+                    seed = self.seed + epoch
+                    sources = []
+                    for i, source in enumerate(self.raw_ds):
+                        # d = source.shuffle(seed=cur_seed, buffer_size=self.buffer_size)
+                        # sources.append(d)
+                        self.raw_ds[i].set_epoch(epoch)
+                        sources.append(self.raw_ds[i])
+                    return interleave_datasets(
+                        sources,
+                        probabilities=[0.30, 0.23, 0.32, 0.1, 0.05],
+                        stopping_strategy="all_exhausted",
+                        seed=seed,
+                    )
+
+                def __iter__(self):
+                    epoch = self.epoch
+                    while True:
+                        yield from self._build_pass(epoch)
+                        epoch += 1
+
+                def state_dict(self):
+                    state_dict = {}
+                    for i, source in enumerate(self.raw_ds):
+                        state_dict[f"dataset_{i}_state"] = source.state_dict()
+                    state_dict["dataset_epoch_count"] = self.epoch
+                    return state_dict
+
+                def load_state_dict(self, state_dict):
+                    for i, source in enumerate(self.raw_ds):
+                        source.load_state_dict(state_dict[f"dataset_{i}_state"])
+                    self.epoch = state_dict.get("dataset_epoch_count", 0)
+
+            dataset = PyTorchHFIterableDataset(dataset, seed=self.hparams.seed)
 
         return StatefulDataLoader(
             dataset,
