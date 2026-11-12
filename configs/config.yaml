@@ -1,5 +1,6 @@
 seed: 3407
 model:
+    min_lr: 1e-6
     train_encoder_layer: -1 # train all encoder layers
     compile: false
 

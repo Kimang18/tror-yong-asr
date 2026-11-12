@@ -25,8 +25,51 @@ from src.net import TrorYongASRDev
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+class LRCosineAnnealingWithLinearWarmupAndFloor(torch.optim.lr_scheduler.LRScheduler):
+    """Similar to cosine annealing with warmup but add floor value"""
+
+    def __init__(
+        self,
+        optimizer,
+        warmup_steps: int,
+        total_steps: int,
+        min_lr: float | list[float] = 1e-6,
+        last_epoch=-1,
+    ):
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        n_groups = len(optimizer.param_groups)
+        self.min_lrs = (
+            list(min_lr) if isinstance(min_lr, (list, tuple)) else [min_lr] * n_groups
+        )
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        step = self.last_epoch
+        if step < self.warmup_steps:
+            scale = float(step) / float(max(1.0, self.warmup_steps))
+            return [base_lr * scale for base_lr in self.base_lrs]
+
+        progress = float(step - self.warmup_steps) / float(
+            max(1.0, self.total_steps - self.warmup_steps)
+        )
+        progress = min(1.0, progress)  # keep to floor at the training ends
+        cosine = 0.5 * (1 + math.cos(math.pi * progress))
+
+        return [
+            min_lr + (base_lr - min_lr) * cosine
+            for min_lr, base_lr in zip(self.min_lrs, self.base_lrs)
+        ]
+
+
 class TrorYongModule(L.LightningModule):
-    def __init__(self, net, train_encoder_layer=-1, compile=False):
+    def __init__(
+        self,
+        net,
+        min_lr: float = 1e-6,
+        train_encoder_layer: int = -1,
+        compile: bool = False,
+    ):
         super().__init__()
         self.save_hyperparameters(ignore=["net"])
         self.net = net
@@ -150,13 +193,9 @@ class TrorYongModule(L.LightningModule):
 
         warmup_steps = int(0.015 * total_opt_steps)
 
-        def lr_lambda(step):
-            if step < warmup_steps:
-                return (step + 1) / max(1, warmup_steps)
-            progress = (step - warmup_steps) / max(1, total_opt_steps - warmup_steps)
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        scheduler = LRCosineAnnealingWithLinearWarmupAndFloor(
+            optimizer, warmup_steps, total_opt_steps, min_lr=self.hparams.min_lr
+        )
         # scheduler = get_cosine_schedule_with_warmup(
         #     optimizer, num_warmup_steps=warmup_steps, num_training_steps=optimizer_steps
         # )
